@@ -1,8 +1,11 @@
-import * as conf from './conf.js'
+import * as route from './route.js'
 import * as cookie from './cookie.js'
-import * as util from './util.js'
 import * as urlx from './urlx.js'
+import * as util from './util'
 import * as tld from './tld.js'
+
+
+let conf
 
 const REFER_ORIGIN = location.origin + '/'
 const ENABLE_3RD_COOKIE = true
@@ -17,23 +20,32 @@ const REQ_HDR_ALLOW = new Set('accept,accept-charset,accept-encoding,accept-lang
 // 因此请求头中设置 aceh__ 标记，告知服务器是否要返回所有字段名。
 let isAcehOld = true
 
-const whiteSet = new Set(conf.DIRECT_HOST)
+let directHostSet
+
+
+export function setConf(v) {
+  conf = v
+  // TODO:
+  directHostSet = new Set([])
+}
+
 
 /**
  * @param {URL} targetUrlObj 
- * @param {string} clientTld 
+ * @param {URL} clientUrlObj 
  * @param {Request} req 
  */
-function getReqCookie(targetUrlObj, clientTld, req) {
+function getReqCookie(targetUrlObj, clientUrlObj, req) {
   const cred = req.credentials
   if (cred === 'omit') {
-    return
+    return ''
   }
   if (cred === 'same-origin') {
     // TODO:
     const targetTld = tld.getTld(targetUrlObj.hostname)
+    const clientTld = tld.getTld(clientUrlObj.hostname)
     if (targetTld !== clientTld) {
-      return
+      return ''
     }
   }
   return cookie.concat(targetUrlObj)
@@ -41,15 +53,11 @@ function getReqCookie(targetUrlObj, clientTld, req) {
 
 
 /**
- * @param {Object<string, string | string[]>} headers 
+ * @param {string[]} cookieStrArr 
  * @param {URL} urlObj 
  * @param {URL} cliUrlObj
  */
-function procResCookie(headers, urlObj, cliUrlObj) {
-  const x = headers['set-cookie']
-  if (!x) {
-    return
-  }
+function procResCookie(cookieStrArr, urlObj, cliUrlObj) {
   if (!ENABLE_3RD_COOKIE) {
     const urlTld = tld.getTld(urlObj.hostname)
     const cliTld = tld.getTld(cliUrlObj.hostname)
@@ -57,57 +65,81 @@ function procResCookie(headers, urlObj, cliUrlObj) {
       return
     }
   }
-  const arr = Array.isArray(x) ? x : [x]
-  return arr
+  return cookieStrArr
     .map(str => cookie.parse(str, urlObj))
     .filter(item => item && !item.httpOnly)
 }
 
 
 /**
- * @param {Headers} resHdr 
- * @return {ResponseInit}
+ * @param {Response} res 
  */
-function getResInfo(resHdr) {
-  const headers = {}
-  let status = 0
+function getResInfo(res) {
+  const resHdrRaw = res.headers
 
-  resHdr.forEach((val, key) => {
+  /** @type {string[]} */
+  const cookieStrArr = []
+
+  const headers = new Headers()
+
+  let status = res.status
+  if (status === 311 ||
+      status === 312 ||
+      status === 313 ||
+      status === 317 ||
+      status === 318
+  ) {
+    status -= 10
+  }
+
+  resHdrRaw.forEach((val, key) => {
     if (key === 'access-control-allow-origin' ||
         key === 'access-control-expose-headers') {
       return
     }
-    // 原始状态码
-    if (key === '--s') {
-      status = +val
-      return
-    }
-    // 该字段用于测试浏览器是否支持 aceh: *
     if (key === '--t') {
-      isAcehOld = false
-      console.log('[jsproxy] support ACEH *')
       return
     }
-    // 重名字段，转成数组
+    // 还原重名字段
+    //  0-key: v1
+    //  1-key: v2
+    // =>
+    //  key: v1, v2
+    //
+    // 对于 set-cookie 单独存储，因为合并会破坏 cookie 格式：
+    //  var h = new Headers()
+    //  h.append('set-cookie', 'hello')
+    //  h.append('set-cookie', 'world')
+    //  h.get('set-cookie')  // "hello, world"
+    //
     const m = key.match(/^\d+-(.+)/)
     if (m) {
-      const k = m[1]
-      const arr = headers[k]
-      if (Array.isArray(arr)) {
-        arr.push(val)
+      key = m[1]
+      if (key === 'set-cookie') {
+        cookieStrArr.push(val)
       } else {
-        headers[k] = [val]
+        headers.append(key, val)
       }
       return
     }
-    // 转义字段
+
+    // 还原转义字段（`--key` => `key`）
     if (key.startsWith('--')) {
       key = key.substr(2)
     }
-    headers[key] = val
+
+    // 删除 vary 字段的 --url
+    if (key === 'vary') {
+      if (val === '--url') {
+        return
+      }
+      val = val.replace('--url,', '')
+    }
+
+    headers.set(key, val)
   })
 
-  return {status, headers}
+  return {status, headers, cookieStrArr}
 }
 
 
@@ -117,26 +149,29 @@ function getResInfo(resHdr) {
  * @param {URL} cliUrlObj 
  */
 function initReqHdr(req, urlObj, cliUrlObj) {
-  const sysHdr = {
-    '--ver': conf.JS_VER,
+  const sysHdr = new Headers({
+    '--ver': conf.ver,
     '--url': urlx.delHash(urlObj.href),
-  }
+    '--mode': req.mode,
+    '--type': req.destination || '',
+    '--level': '1',
+  })
   const extHdr = {}
   let hasExtHdr = false
 
   req.headers.forEach((val, key) => {
     if (REQ_HDR_ALLOW.has(key)) {
-      sysHdr[key] = val
+      sysHdr.set(key, val)
     } else {
       extHdr[key] = val
       hasExtHdr = true
     }
   })
 
-  if (sysHdr['origin']) {
-    sysHdr['--origin'] = cliUrlObj.origin
+  if (sysHdr.has('origin')) {
+    sysHdr.set('--origin', cliUrlObj.origin)
   } else {
-    sysHdr['--origin'] = ''
+    sysHdr.set('--origin', '')
   }
 
   const referer = req.referrer
@@ -144,25 +179,77 @@ function initReqHdr(req, urlObj, cliUrlObj) {
     // TODO: CSS 引用图片的 referer 不是页面 URL，而是 CSS URL
     if (referer === REFER_ORIGIN) {
       // Referrer Policy: origin
-      sysHdr['--referer'] = cliUrlObj.origin + '/'
+      sysHdr.set('--referer', cliUrlObj.origin + '/')
     } else {
-      sysHdr['--referer'] = urlx.decUrlStrAbs(referer)
+      sysHdr.set('--referer', urlx.decUrlStrAbs(referer))
     }
   }
 
-  const cliTld = tld.getTld(cliUrlObj.hostname)
-  const cookie = getReqCookie(urlObj, cliTld, req)
-  if (cookie) {
-    sysHdr['--cookie'] = cookie
-  }
+  const cookie = getReqCookie(urlObj, cliUrlObj, req)
+  sysHdr.set('--cookie', cookie)
 
   if (hasExtHdr) {
-    sysHdr['--ext'] = JSON.stringify(extHdr)
+    sysHdr.set('--ext', JSON.stringify(extHdr))
   }
   if (isAcehOld) {
-    sysHdr['--aceh'] = '1'
+    sysHdr.set('--aceh', '1')
   }
   return sysHdr
+}
+
+
+/**
+ * 直连的资源
+ * 
+ * @param {URL} urlObj 
+ * @param {Request} req 
+ * @param {RequestInit} reqOpt 
+ */
+async function proxyDirect(urlObj, req, reqOpt) {
+  let hdr = req.headers
+
+  // 从地址栏访问资源，请求头会出现该字段，导致出现 preflight
+  if (hdr.has('upgrade-insecure-requests')) {
+    hdr = new Headers(hdr)
+    hdr.delete('upgrade-insecure-requests')
+  }
+  reqOpt.headers = hdr
+
+  try {
+    const res = await fetch(urlObj.href, reqOpt)
+    if (res.status === 200 || res.status === 206) {
+      return res
+    }
+    console.warn('[jsproxy] proxyDirect invalid status:', res.status, urlObj.href)
+  } catch (err) {
+    console.warn('[jsproxy] proxyDirect fail:', urlObj.href)
+  }
+}
+
+
+/**
+ * @param {string} url
+ * @param {*} reqOpt 
+ */
+async function proxyNode2(url, reqOpt) {
+  try {
+    var res = await fetch(url, reqOpt)
+  } catch (err) {
+    return null
+  }
+
+  if (res.status === 400) {
+    const err = await res.text()
+    console.warn('[jsproxy] proxy fail:', err)
+    return null
+  }
+
+  if (res.status !== 200 && res.status !== 206) {
+    console.warn('[jsproxy] proxy invalid status:', res.status)
+    return null
+  }
+
+  return res
 }
 
 
@@ -194,100 +281,151 @@ export async function launch(req, urlObj, cliUrlObj) {
     reqOpt.signal = req.signal
   }
 
-  let res, resOpt, cookies
+  const urlHash = util.strHash(urlObj.href)
+
+  /** @type {Response} */
+  let res
+
+  if (!urlx.isHttpProto(urlObj.protocol)) {
+    // 非 HTTP 协议的资源，直接访问
+    // 例如 youtube 引用了 chrome-extension: 协议的脚本
+    res = await fetch(req)
+  }
+  else if (method === 'GET') {
+    if (directHostSet.has(urlObj.host)) {
+      // 支持 cors 的资源
+      // 有些服务器配置了 acao: *，直连可加速
+      res = await proxyDirect(urlObj, req, reqOpt)
+    }
+    else {
+      // 本地 CDN 加速
+      // 一些大网站常用的静态资源存储在 jsdelivr 上
+      const fileID = getCdnFileId(urlHash)
+      if (fileID !== -1) {
+        res = await proxyFromCdn(fileID)
+        console.log('cdn hit:', urlObj.href)
+      }
+    }
+  }
+
+  if (res) {
+    return {
+      res,
+      status: res.status || 200,
+      headers: new Headers(res.headers),
+    }
+  }
+
+  // 以上都不可用，走自己的代理服务器
+  // 请求参数打包在头部字段
+  const reqHdr = initReqHdr(req, urlObj, cliUrlObj)
+  reqOpt.headers = reqHdr
+
+  let level = 1
+  let proxyUrl = route.genHttpUrl(urlHash, level)
+  res = await fetch(proxyUrl, reqOpt)
+
+  let resHdr = res.headers
+
+  // 检测浏览器是否支持 aceh: *
+  if (isAcehOld && resHdr.has('--t')) {
+    isAcehOld = false
+    reqHdr.delete('--aceh')
+  }
 
   do {
-    // TODO: 逻辑调整。
-    if (method === 'GET' && whiteSet.has(urlObj.host)) {
-      // 白名单资源直接访问
-      reqOpt.headers = req.headers
-      try {
-        res = await fetch(urlObj, reqOpt)
-        if (res.status === 200) {
-          break
-        }
-      } catch (err) {
-      }
-      console.warn('[jsproxy] direct fetch fail:', urlObj.href)
-    }
-
-    const proxyUrl = genHttpUrl(urlObj)
-    if (!proxyUrl) {
-      // 非 HTTP 类型，比如 chrome-extension:
-      reqOpt.headers = req.headers
-      res = await fetch(urlObj, reqOpt)
+    // 是否切换节点
+    if (!resHdr.has('--switched')) {
       break
     }
 
-    // 代理
-    reqOpt.headers = initReqHdr(req, urlObj, cliUrlObj)
-    res = await fetch(proxyUrl, reqOpt)
-    resOpt = getResInfo(res.headers)
+    const rawInfo = resHdr.get('--raw-info')
+    reqHdr.set('--raw-info', rawInfo)
 
-    cookies = procResCookie(resOpt.headers, urlObj, cliUrlObj)
+    // TODO: 逻辑优化
+    level++
+    reqHdr.set('--level', level + '')
+    proxyUrl = route.genHttpUrl(urlHash, level)
+
+    res = await proxyNode2(proxyUrl, reqOpt)
+    if (res) {
+      break
+    }
+
+    // 切换失败，使用原节点
+    // TODO: 尝试更多廉价节点，最坏情况才使用原节点
+    reqHdr.set('--level', '0')
+    proxyUrl = route.genHttpUrl(urlHash, 0)
+    res = await fetch(proxyUrl, reqOpt)
   } while (0)
 
-  resOpt = resOpt || {
-    status: res.status,
-    headers: res.headers,
+  const {
+    status, headers, cookieStrArr
+  } = getResInfo(res)
+
+  let cookies
+  if (cookieStrArr.length) {
+    cookies = procResCookie(cookieStrArr, urlObj, cliUrlObj)
   }
-  return {res, resOpt, cookies}
+
+  return {res, status, headers, cookies}
+}
+
+
+const CDN = 'https://cdn.jsdelivr.net/gh/zjcqoo/cache@'
+
+/** @type {Uint32Array} */
+let gCdnUrlHashList
+
+
+
+export async function loadManifest() {
+  // TODO: 记录每个资源的版本号
+  const res = await fetch(CDN + '5/list.txt')
+  const buf = await res.arrayBuffer()
+  gCdnUrlHashList = new Uint32Array(buf)
 }
 
 
 /**
- * @param {URL} urlObj 
+ * @param {number} urlHash 
  */
-export function genHttpUrl(urlObj) {
-  if (!urlx.isHttpProto(urlObj.protocol)) {
-    return null
+export function getCdnFileId(urlHash) {
+  if (!gCdnUrlHashList) {
+    return -1
   }
-  return `https://${curHost}/http`
+  const fileId = util.binarySearch(gCdnUrlHashList, urlHash)
+  return fileId
 }
 
 
 /**
- * @param {URL} urlObj 
- * @param {Object<string, string>} args 
+ * @param {number} id 
  */
-export function genWsUrl(urlObj, args) {
-  let scheme = 'https'
-  switch (urlObj.protocol) {
-  case 'wss:':
-    break
-  case 'ws:':
-    scheme = 'http'
-    break
-  default:
-    return null
+export async function proxyFromCdn(id) {
+  const urlHash = gCdnUrlHashList[id]
+  const hashHex = util.numToHex(urlHash, 8)
+
+  try {
+    const res = await fetch(CDN + '5/' + hashHex + '.txt')
+    var buf = await res.arrayBuffer()
+  } catch (err) {
+    console.warn('[jsproxy] proxyFromCdn fail')
+    return
   }
 
-  const t = urlx.delScheme(urlx.delHash(urlObj.href))
-  args['url__'] = scheme + '://' + t
-  args['ver__'] = conf.JS_VER
+  const b = new Uint8Array(buf)
+  
+  const hdrLen = b[0] << 24 | b[1] << 16 | b[2] << 8 | b[3]
+  const hdrBuf = b.subarray(4, 4 + hdrLen)
+  const hdrStr = util.bytesToStr(hdrBuf)
+  const hdrObj = JSON.parse(hdrStr)
 
-  return `wss://${curHost}/ws?` + new URLSearchParams(args)
-}
+  const body = b.subarray(4 + hdrLen)
+  hdrObj['date'] = new Date().toUTCString()
 
-
-// TODO: 临时测试
-let curNode = conf.NODE_DEF
-let curHost = conf.NODE_MAP[curNode]
-
-/**
- * @param {string} node 
- */
-export function switchNode(node) {
-  const host = conf.NODE_MAP[node]
-  if (!host) {
-    return false
-  }
-  curNode = node
-  curHost = host
-  return true
-}
-
-
-export function getNode() {
-  return curNode
+  return new Response(body, {
+    status: 200,
+    headers: hdrObj
+  })
 }

@@ -13,17 +13,16 @@ const undefined = void 0
 
 
 /**
- * @param {Window} win 
+ * @param {WindowOrWorkerGlobalScope} win 
  * @param {string} name 
- * @param {string} origin 
+ * @param {string} prefix 
  */
-function setup(win, name, origin) {
+function setup(win, name, prefix) {
   /** @type {Storage} */
   const raw = win[name]
   if (!raw) {
     return
   }
-  const prefix = origin + ':'
   const prefixLen = prefix.length
 
   const nativeMap = {
@@ -34,6 +33,7 @@ function setup(win, name, origin) {
     key,
     constructor: raw.constructor,
     toString: () => raw.toString(),
+    [Symbol.toStringTag]: 'Storage',
     get length() {
       return ownKeys(raw)
         .filter(v => v.startsWith(prefix))
@@ -42,15 +42,15 @@ function setup(win, name, origin) {
   }
   
   /**
-   * @param {string} key 
+   * @param {*} key 
    */
   function getItem(key) {
     return raw.getItem(prefix + key)
   }
 
   /**
-   * @param {string} key 
-   * @param {string} value 
+   * @param {*} key 
+   * @param {string} val 
    */
   function setItem(key, val) {
     // TODO: 同步到 indexedDB
@@ -58,7 +58,7 @@ function setup(win, name, origin) {
   }
 
   /**
-   * @param {string} key 
+   * @param {*} key 
    */
   function removeItem(key) {
     return raw.removeItem(prefix + key)
@@ -87,7 +87,11 @@ function setup(win, name, origin) {
    */
   function getAllKeys() {
     return ownKeys(raw)
-      .filter(v => v.startsWith(prefix))
+      .filter(v => {
+        if (typeof v === 'string') {
+          return v.startsWith(prefix)
+        }
+      })
       .map(v => v.substr(prefixLen))
   }
 
@@ -121,18 +125,18 @@ function setup(win, name, origin) {
       console.log('[jsproxy] %s has: %s', name, key)
       return (prefix + key) in raw
     },
-    enumerate(obj) {
-      console.log('[jsproxy] %s enumerate: %s', name)
-      // TODO:
-    },
+    // enumerate(obj) {
+    //   console.log('[jsproxy] %s enumerate: %s', name)
+    //   // TODO:
+    // },
     ownKeys(obj) {
       // console.log('[jsproxy] %s ownKeys', name)
       return getAllKeys()
     },
-    defineProperty(obj, key, desc) {
-      // console.log('[jsproxy] %s defineProperty: %s', name, key)
-      // TODO:
-    },
+    // defineProperty(obj, key, desc) {
+    //   // console.log('[jsproxy] %s defineProperty: %s', name, key)
+    //   // TODO:
+    // },
     getOwnPropertyDescriptor(obj, key) {
       // console.log('[jsproxy] %s getOwnPropertyDescriptor: %s', name, key)
       return getOwnPropertyDescriptor(raw, prefix + key)
@@ -148,11 +152,13 @@ function setup(win, name, origin) {
  * @param {string} origin 
  */
 export function createStorage(global, origin) {
+  const prefix = origin + ':'
+
   //
   // Web Storage
   //
-  setup(global, 'localStorage', origin)
-  setup(global, 'sessionStorage', origin)
+  setup(global, 'localStorage', prefix)
+  setup(global, 'sessionStorage', prefix)
 
   //
   // Storage API
@@ -167,11 +173,11 @@ export function createStorage(global, origin) {
   }
 
   // indexedDB
-  const idbProto = global.IDBFactory.prototype
+  const idbProto = global['IDBFactory'].prototype
   hookFunc(idbProto, 'open', dbOpenHook)
 
   // Cache Storage
-  const cacheStorageProto = global.CacheStorage.prototype
+  const cacheStorageProto = global['CacheStorage'].prototype
   hookFunc(cacheStorageProto, 'open', dbOpenHook)
 
   // WebSQL

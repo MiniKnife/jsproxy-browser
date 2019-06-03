@@ -1,7 +1,8 @@
 import * as env from './env.js'
+import * as path from './path.js'
 
 
-const PREFIX = env.PATH_PREFIX
+const PREFIX = path.PREFIX
 const PREFIX_LEN = PREFIX.length
 
 
@@ -23,7 +24,7 @@ function isInternalUrl(url) {
 
 /**
  * @param {string} url 
- * @param {string} baseUrl 
+ * @param {string | URL=} baseUrl 
  */
 export function newUrl(url, baseUrl) {
   try {
@@ -81,7 +82,7 @@ export function encUrlStrAbs(url) {
   if (!urlObj) {
     return url
   }
-  return decUrlObj(urlObj)
+  return encUrlObj(urlObj)
 }
 
 

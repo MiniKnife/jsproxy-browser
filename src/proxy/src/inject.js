@@ -1,13 +1,13 @@
-import * as env from './env.js'
+import * as path from './path.js'
 import * as util from "./util";
 // import * as jsfilter from './jsfilter.js'
 
 
 
 const WORKER_INJECT = util.strToBytes(`\
-if (typeof importScripts === 'function' && !self.window) {
-  self.__PATH__ = '${env.PATH_ROOT}';
-  importScripts('${env.PATH_JS}');
+if (typeof importScripts === 'function' && !self.window && !self.__PATH__) {
+  self.__PATH__ = '${path.ROOT}';
+  importScripts('${path.HELPER}');
 }
 `)
 
@@ -35,16 +35,15 @@ chrome-extension-resource: \
  * @param {number} pageId 
  */
 export function getHtmlCode(urlObj, pageId) {
-  const icoUrl = env.PATH_PREFIX + urlObj.origin + '/favicon.ico'
+  const icoUrl = path.PREFIX + urlObj.origin + '/favicon.ico'
 
   return util.strToBytes(`\
 <!-- JS PROXY HELPER -->
 <!doctype html>
 <link rel="icon" href="${icoUrl}" type="image/x-icon">
-<meta charset="utf-8">
 <meta http-equiv="content-security-policy" content="frame-src ${CSP}; object-src ${CSP}">
 <base href="${urlObj.href}">
-<script data-id="${pageId}" src="${env.PATH_JS}"></script>
+<script data-id="${pageId}" src="${path.HELPER}"></script>
 <!-- https://github.com/EtherDream/jsproxy -->
 <!-- PADDING ${PADDING} -->
 

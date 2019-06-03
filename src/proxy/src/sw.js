@@ -1,4 +1,5 @@
-import * as env from './env.js'
+import * as path from './path.js'
+import * as route from './route.js'
 import * as urlx from './urlx.js'
 import * as util from './util.js'
 import * as cookie from './cookie.js'
@@ -8,9 +9,21 @@ import * as jsfilter from './jsfilter.js'
 import * as inject from './inject.js'
 
 
+let gConf
+
 const MAX_REDIR = 5
 
+/** @type {ServiceWorkerGlobalScope} */
+// @ts-ignore
+const global = self
+const clients = global.clients
 
+
+/**
+ * @param {*} target 
+ * @param {number} cmd 
+ * @param {*=} val 
+ */
 function sendMsg(target, cmd, val) {
   if (target) {
     target.postMessage([cmd, val])
@@ -23,7 +36,7 @@ function sendMsg(target, cmd, val) {
 // 也可以用 clientId 关联，但兼容性不高
 let pageCounter = 0
 
-/** @type {Map<number, [Function, number]} */
+/** @type {Map<number, [Function, number]>} */
 const pageWaitMap = new Map()
 
 function genPageId() {
@@ -69,7 +82,7 @@ function pageNotify(id, isDone) {
 
 function makeErrRes(desc) {
   return new Response(desc, {
-    status: 200
+    status: 500
   })
 }
 
@@ -92,7 +105,7 @@ function processHtml(res, resOpt, urlObj) {
         const pageId = genPageId()
         const buf = inject.getHtmlCode(urlObj, pageId)
         controller.enqueue(buf)
-console.log('new pageId:',pageId)
+
         // 留一些时间给页面做异步初始化
         const done = await pageWait(pageId)
         if (!done) {
@@ -166,52 +179,50 @@ async function getUrlByClientId(id) {
  * @param {URL} urlObj
  * @param {URL} cliUrlObj 
  * @param {number} redirNum
+ * @returns {Promise<Response>}
  */
 async function forward(req, urlObj, cliUrlObj, redirNum) {
   const {
-    res, resOpt, cookies
+    res, status, headers, cookies
   } = await network.launch(req, urlObj, cliUrlObj)
-
-  const resStatus = resOpt.status
-  const resHdrObj = resOpt.headers
 
   if (cookies) {
     sendMsgToPages(MSG.SW_COOKIE_PUSH, cookies)
   }
 
+  const resOpt = {status, headers}
+
   // 空响应
   // https://fetch.spec.whatwg.org/#statuses
-  if (resStatus === 101 ||
-      resStatus === 204 ||
-      resStatus === 205 ||
-      resStatus === 304
+  if (status === 101 ||
+      status === 204 ||
+      status === 205 ||
+      status === 304
   ) {
     return new Response(null, resOpt)
   }
 
   // 处理重定向
-  if (resStatus === 301 ||
-      resStatus === 302 ||
-      resStatus === 303 ||
-      resStatus === 307 ||
-      resStatus === 308
+  if (status === 301 ||
+      status === 302 ||
+      status === 303 ||
+      status === 307 ||
+      status === 308
   ) {
-    const locStr = resHdrObj['location']
-    if (locStr) {
-      // 如果重定向到相对路径，则基于请求的 URL（不是页面的 URL）
-      const locObj = urlx.newUrl(locStr, urlObj)
-      if (locObj) {
-        // 跟随模式，返回最终数据
-        if (req.redirect === 'follow') {
-          if (++redirNum === MAX_REDIR) {
-            return makeErrRes('too many redirects')
-          }
-          return forward(req, locObj, cliUrlObj, redirNum)
+    const locStr = headers.get('location')
+    const locObj = locStr && urlx.newUrl(locStr, urlObj)
+    if (locObj) {
+      // 跟随模式，返回最终数据
+      if (req.redirect === 'follow') {
+        if (++redirNum === MAX_REDIR) {
+          return makeErrRes('too many redirects')
         }
-        // 不跟随模式（例如页面跳转），返回 30X 状态
-        resHdrObj['location'] = urlx.encUrlObj(locObj)
+        return forward(req, locObj, cliUrlObj, redirNum)
       }
+      // 不跟随模式（例如页面跳转），返回 30X 状态
+      headers.set('location', urlx.encUrlObj(locObj))
     }
+
     // firefox, safari 保留内容会提示页面损坏
     return new Response(null, resOpt)
   }
@@ -221,7 +232,7 @@ async function forward(req, urlObj, cliUrlObj, redirNum) {
   // 可能存在多个段，并且值可能包含引号。例如：
   // content-type: text/html; ...; charset="gbk"
   //
-  const ctVal = resHdrObj['content-type'] || ''
+  const ctVal = headers.get('content-type') || ''
   const [, mime, charset] = ctVal
     .toLocaleLowerCase()
     .match(/([^;]*)(?:.*?charset=['"]?([^'"]+))?/)
@@ -235,12 +246,12 @@ async function forward(req, urlObj, cliUrlObj, redirNum) {
     const buf = await res.arrayBuffer()
     const ret = processJs(buf, charset)
 
-    resHdrObj['content-type'] = 'text/javascript'
+    headers.set('content-type', 'text/javascript')
     return new Response(ret, resOpt)
   }
 
   if (req.mode === 'navigate' && mime === 'text/html') {
-    return processHtml(res, resOpt, urlObj, true)
+    return processHtml(res, resOpt, urlObj)
   }
 
   return new Response(res.body, resOpt)
@@ -259,101 +270,191 @@ async function proxy(e, urlObj) {
   }
   const cliUrlObj = new URL(cliUrlStr)
 
-  // try {
-    return forward(e.request, urlObj, cliUrlObj, 0)
-  // } catch (err) {
-  //   console.warn('[jsproxy] forward err:', err)
-  // }
+  try {
+    return await forward(e.request, urlObj, cliUrlObj, 0)
+  } catch (err) {
+    console.error(err)
+    return makeErrRes(err.stack)
+  }
 }
 
 
-self.addEventListener('fetch', e => {
-  /** @type {Request} */
+/**
+ * @param {FetchEvent} e 
+ */
+async function onFetch(e) {
+  if (!gConf) {
+    gConf = await initConf()
+  }
   const req = e.request
-  const urlStr = req.url
+  const urlStr = urlx.delHash(req.url)
 
-  // homepage, or injected js
-  if (urlStr.startsWith(env.PATH_ROOT) && 
-    !urlStr.startsWith(env.PATH_PREFIX)) {
-    return
+  // 首页（例如 https://zjcqoo.github.io/index.html）
+  // 配置（例如 https://zjcqoo.github.io/conf.js）
+  if (urlStr === path.ROOT ||
+      urlStr === path.HOME ||
+      urlStr === path.CONF
+  ) {
+    return fetch(urlStr)
+  }
+
+  // 注入页面的脚本（例如 https://zjcqoo.github.io/helper.js）
+  if (urlStr === path.HELPER) {
+    return fetch(self['__FILE__'])
+  }
+
+  // 静态资源（例如 https://zjcqoo.github.io/assets/ico/google.png）
+  if (urlStr.startsWith(path.ASSETS)) {
+    const filePath = urlStr.substr(path.ASSETS.length)
+    return fetch(gConf.assets_cdn + filePath)
   }
 
   const targetUrlStr = urlx.decUrlStrAbs(urlStr)
   const targetUrlObj = urlx.newUrl(targetUrlStr)
 
-  let ret
   if (targetUrlObj) {
-    ret = proxy(e, targetUrlObj)
-  } else {
-    ret = makeErrRes('invalid url: ' + targetUrlStr)
+    return proxy(e, targetUrlObj)
   }
-  e.respondWith(ret)
+  return makeErrRes('invalid url: ' + targetUrlStr)
+}
+
+
+function updateConf(conf) {
+  route.setConf(conf)
+  network.setConf(conf)
+}
+
+async function fetchConf() {
+  const res = await fetch('conf.js')
+  const txt = await res.text()
+  let ret
+  self['jsproxy_config'] = function(v) {
+    ret = v
+  }
+  Function(txt)()
+  return ret
+}
+
+async function loadConf() {
+  const cache = await caches.open("sys")
+  const req = new Request("/conf.json")
+  const res = await cache.match(req)
+  if (res) {
+    return res.json()
+  }
+}
+
+async function saveConf(conf) {
+  const json = JSON.stringify(conf)
+  const cache = await caches.open("sys")
+  const req = new Request("/conf.json")
+  const res = new Response(json);
+  return cache.put(req, res)
+}
+
+let initing = false
+let initingQueue = []
+
+async function initConf() {
+  if (initing) {
+    return new Promise(f => {
+      initingQueue.push(f)
+    })
+  }
+  initing = true
+
+  let conf
+  try {
+    conf = await loadConf()
+  } catch (err) {
+    console.warn('loadConf fail:', err)
+  }
+  if (!conf) {
+    conf = await fetchConf()
+    console.log('fetchConf:', conf)
+    await saveConf()
+  }
+  updateConf(conf)
+
+  network.loadManifest()
+
+  initing = false
+  initingQueue.forEach(f => f(conf))
+  return conf
+}
+
+
+global.addEventListener('fetch', e => {
+  e.respondWith(onFetch(e))
 })
 
 
-self.addEventListener('message', e => {
+global.addEventListener('message', e => {
   // console.log('sw msg:', e.data)
   const [cmd, val] = e.data
+  const src = e.source
 
   switch (cmd) {
   case MSG.PAGE_COOKIE_PUSH:
     cookie.set(val)
-    sendMsgToPages(MSG.SW_COOKIE_PUSH, [val], e.source.id)
+    // @ts-ignore
+    sendMsgToPages(MSG.SW_COOKIE_PUSH, [val], src.id)
     break
-  case MSG.PAGE_COOKIE_PULL:
-    // console.log('SW MSG.COOKIE_PULL:', e.source.id)
-    sendMsg(e.source, MSG.SW_COOKIE_PUSH, cookie.getAll())
+
+  case MSG.PAGE_INFO_PULL:
+    // console.log('SW MSG.COOKIE_PULL:', src.id)
+    sendMsg(src, MSG.SW_INFO_PUSH, {
+      cookies: cookie.getNonHttpOnlyItems(),
+      conf: gConf,
+    })
     break
 
   case MSG.PAGE_INIT_BEG:
     // console.log('SW MSG.PAGE_INIT_BEG:', val)
     pageNotify(val, false)
     break
+
   case MSG.PAGE_INIT_END:
     // console.log('SW MSG.PAGE_INIT_END:', val)
     pageNotify(val, true)
     break
 
-  case MSG.SW_LIFE_ADD:
-    // sw life +1s
-    e.waitUntil(new Promise(cb => {
-      setTimeout(_ => {
-        sendMsg(sw, MSG.SW_LIFE_ADD)
-        cb()
-      }, 1000)
-    }))
+  case MSG.PAGE_CONF_GET:
+    if (gConf) {
+      sendMsg(src, MSG.SW_CONF_RETURN, gConf)
+    } else {
+      initConf().then(conf => {
+        gConf = conf
+        sendMsg(src, MSG.SW_CONF_RETURN, gConf)
+      })
+    }
     break
 
-  case MSG.PAGE_NODE_SWITCH:
-    const ret = network.switchNode(val)
-    if (ret) {
-      console.log('[jsproxy] node switch to: %s', val)
-    } else {
-      console.warn('[jsproxy] invalid node name:', val)
-    }
-    sendMsgToPages(MSG.SW_NODE_SWITCHED, val)
+  case MSG.PAGE_CONF_SET:
+    gConf = val
+    saveConf(gConf)
+    updateConf(gConf)
+    sendMsgToPages(MSG.SW_CONF_CHANGE, gConf)
     break
-  case MSG.PAGE_NODE_GET:
-    sendMsg(e.source, MSG.SW_NODE_SWITCHED, network.getNode())
+
+  case MSG.PAGE_READY_CHECK:
+    sendMsg(src, MSG.SW_READY)
     break
   }
 })
 
 
-self.addEventListener('install', e => {
+global.addEventListener('install', e => {
   console.log('oninstall:', e)
-	skipWaiting()
+  e.waitUntil(global.skipWaiting())
 })
 
 
-let sw
-
-self.addEventListener('activate', e => {
-  clients.claim()
+global.addEventListener('activate', e => {
   console.log('onactivate:', e)
-  sw = registration.active
   sendMsgToPages(MSG.SW_READY, 1)
-  sendMsg(sw, MSG.SW_LIFE_ADD)
+
+  e.waitUntil(clients.claim())
 })
 
 
